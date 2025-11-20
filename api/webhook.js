@@ -1,5 +1,4 @@
 // api/webhook.js
-const { parseBookmarks, generateMockDataJS } = require('../scripts/parse-bookmarks');
 
 // === 读取原始 body（Node.js 方式）===
 function getRawBody(req) {
@@ -16,6 +15,7 @@ function getRawBody(req) {
 // === 签名验证 ===
 async function verifySignature(payload, signature, secret) {
   if (!secret || !signature) return false;
+
   const encoder = new TextEncoder();
   const key = await crypto.subtle.importKey(
     "raw",
@@ -25,10 +25,14 @@ async function verifySignature(payload, signature, secret) {
     ["sign"]
   );
   const sig = await crypto.subtle.sign("HMAC", key, encoder.encode(payload));
-  const hex = Array.from(new Uint8Array(sig))
-    .map(b => b.toString(16).padStart(2, '0'))
-    .join('');
-  return hex === signature;
+
+  // 转为 Base64 字符串（和 Gitee 一致）
+  const base64Sig = Buffer.from(new Uint8Array(sig)).toString('base64');
+  
+  console.log('🧮 计算出的签名:', base64Sig);
+  console.log('📬 Gitee 发来的签名:', signature);
+
+  return base64Sig === signature;
 }
 
 module.exports = async (req, res) => {
