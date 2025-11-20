@@ -1,7 +1,21 @@
 // api/webhook.js
 const { parseBookmarks, generateMockDataJS } = require('../scripts/parse-bookmarks');
 
-// HMAC-SHA256 签名验证
+// === 新增：从 Node.js req 读取原始 body ===
+function getRawBody(req) {
+  return new Promise((resolve, reject) => {
+    let body = '';
+    req.on('data', chunk => {
+      body += chunk.toString();
+    });
+    req.on('end', () => {
+      resolve(body);
+    });
+    req.on('error', reject);
+  });
+}
+
+// HMAC-SHA256 验证（不变）
 async function verifySignature(payload, signature, secret) {
   if (!secret || !signature) return false;
   const encoder = new TextEncoder();
@@ -25,9 +39,10 @@ module.exports = async (req, res) => {
       return res.status(405).end('Method Not Allowed');
     }
 
-    const body = await req.text();
+    // 👇 关键修复：使用 getRawBody 代替 req.text()
+    const body = await getRawBody(req);
 
-    // === 1. 验证 Webhook 签名 ===
+    // 验证签名
     const signature = req.headers['x-gitee-token'];
     const secret = process.env.GITEE_WEBHOOK_SECRET;
     const isValid = await verifySignature(body, signature, secret);
@@ -36,7 +51,7 @@ module.exports = async (req, res) => {
       return res.status(403).send('Forbidden');
     }
 
-    // === 2. 解析 payload ===
+    // 解析 JSON payload
     let payload;
     try {
       payload = JSON.parse(body);
@@ -45,18 +60,18 @@ module.exports = async (req, res) => {
       return res.status(400).send('Bad Request');
     }
 
-    // === 3. 分支过滤 ===
+    // 分支过滤
     const targetBranch = process.env.GITEE_BRANCH || 'master';
     const expectedRef = `refs/heads/${targetBranch}`;
-    
     if (payload.ref !== expectedRef) {
-      console.log(`⏭️ Ignored push to ${payload.ref} (only ${expectedRef} is processed)`);
-      return res.status(200).json({ ignored: true, ref: payload.ref });
+      console.log(`⏭️ Ignored push to ${payload.ref}`);
+      return res.status(200).json({ ignored: true });
     }
 
-    console.log(`▶️ Processing push to ${targetBranch} branch`);
+    // 后续逻辑保持不变...
+    console.log(`▶️ Processing push to ${targetBranch}`);
 
-    // === 4. 从 Gitee 获取 bookmarks.html ===
+    // === Gitee 获取文件 ===
     const giteeOwner = process.env.GITEE_OWNER;
     const giteeRepo = process.env.GITEE_REPO;
     const giteeFilePath = process.env.GITEE_FILE_PATH || 'bookmarks.html';
@@ -80,20 +95,13 @@ module.exports = async (req, res) => {
     }
 
     const giteeData = await giteeRes.json();
-    if (!giteeData.content) {
-      throw new Error('Gitee file content is empty or missing');
-    }
-
     const htmlContent = Buffer.from(giteeData.content, 'base64').toString('utf8');
 
-    // === 5. 解析书签 ===
+    // 解析书签
     const links = parseBookmarks(htmlContent);
-    if (links.length === 0) {
-      console.warn('⚠️ No bookmarks found in HTML');
-    }
     const mockDataJS = generateMockDataJS(links);
 
-    // === 6. 更新 GitHub 文件 ===
+    // === GitHub 更新 ===
     const githubOwner = process.env.GITHUB_OWNER;
     const githubRepo = process.env.GITHUB_REPO;
     const githubFilePath = process.env.GITHUB_FILE_PATH || 'src/mock_data.js';
@@ -106,7 +114,6 @@ module.exports = async (req, res) => {
 
     const githubFileUrl = `https://api.github.com/repos/${githubOwner}/${githubRepo}/contents/${githubFilePath}`;
 
-    // 获取当前文件 SHA（用于更新）
     let currentSha = null;
     try {
       const shaRes = await fetch(githubFileUrl, {
@@ -115,20 +122,10 @@ module.exports = async (req, res) => {
       if (shaRes.ok) {
         const shaData = await shaRes.json();
         currentSha = shaData.sha;
-      } else if (shaRes.status !== 404) {
-        throw new Error(`Failed to check GitHub file existence: ${shaRes.status}`);
       }
     } catch (e) {
-      console.warn('Could not get SHA:', e.message);
+      console.warn('GitHub file SHA fetch failed:', e.message);
     }
-
-    // 提交更新
-    const updatePayload = {
-      message: `chore: auto-sync bookmarks from Gitee (${targetBranch})`,
-      content: Buffer.from(mockDataJS).toString('base64'),
-      branch: githubBranch
-    };
-    if (currentSha) updatePayload.sha = currentSha;
 
     const updateRes = await fetch(githubFileUrl, {
       method: 'PUT',
@@ -136,7 +133,12 @@ module.exports = async (req, res) => {
         'Authorization': `token ${githubToken}`,
         'Content-Type': 'application/json'
       },
-      body: JSON.stringify(updatePayload)
+      body: JSON.stringify({
+        message: `chore: auto-sync bookmarks from Gitee (${targetBranch})`,
+        content: Buffer.from(mockDataJS).toString('base64'),
+        ...(currentSha ? { sha: currentSha } : {}),
+        branch: githubBranch
+      })
     });
 
     if (!updateRes.ok) {
@@ -144,17 +146,11 @@ module.exports = async (req, res) => {
       throw new Error(`GitHub update failed (${updateRes.status}): ${errMsg}`);
     }
 
-    console.log(`✅ Successfully synced ${links.length} bookmarks`);
-    return res.status(200).json({
-      success: true,
-      branch: targetBranch,
-      count: links.length
-    });
+    console.log(`✅ Synced ${links.length} bookmarks`);
+    res.status(200).json({ success: true, count: links.length });
 
   } catch (error) {
-    console.error('💥 FATAL ERROR:', error.stack || error.message);
-    return res.status(500).json({
-      error: error.message || 'Internal Server Error'
-    });
+    console.error('💥 ERROR:', error.stack || error.message);
+    res.status(500).json({ error: error.message || 'Internal Server Error' });
   }
 };
