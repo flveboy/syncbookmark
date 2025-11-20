@@ -1,5 +1,6 @@
 {
   "name": "bookmark-sync",
   "version": "1.0.0",
+  "description": "Sync Gitee bookmarks to GitHub via Vercel",
   "main": "api/webhook.js"
 }
