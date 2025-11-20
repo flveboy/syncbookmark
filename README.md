@@ -1,4 +1,4 @@
-#vercel版本
+# vercel版本
 GITEE_WEBHOOK_SECRET = your_gitee_webhook_secret
 GITEE_TOKEN = your_gitee_personal_access_token
 GITEE_OWNER = your_gitee_owner
