@@ -201,6 +201,7 @@ async function downloadFavicon(url) {
 
     const candidates = [
       `${origin}/favicon.ico`,
+      `${origin}/favicon/favicon.ico`,
       `${origin}/apple-touch-icon.png`,
       `${origin}/icon.png`,
       `https://www.google.com/s2/favicons?domain=${hostname}&sz=64`,
