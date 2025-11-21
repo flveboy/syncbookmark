@@ -402,6 +402,7 @@ module.exports = async (req, res) => {
 
       const hostname = new URL(url).hostname.replace('www.', '');
       const icon = `/sitelogo/${hostname}.ico`;
+      const iconFilename = `${hostname}.ico`;
 
       targetCategory.sites.push({
         id: generateStableId(url),
