@@ -167,6 +167,106 @@ function parseBookmarks(html) {
   return sites;
 }
 
+// ==================== 【新增】图标相关函数 ====================
+async function listExistingIcons() {
+  const apiUrl = `https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/contents/public/sitelogo?ref=${GITHUB_BRANCH}`;
+  const res = await fetch(apiUrl, {
+    headers: {
+      Authorization: `token ${GITHUB_TOKEN}`,
+      'User-Agent': 'Vercel-Webhook-Sync',
+    },
+  });
+
+  if (!res.ok) {
+    if (res.status === 404) return new Set(); // 目录不存在视为无图标
+    const text = await res.text();
+    throw new Error(`List icons error (${res.status}): ${text}`);
+  }
+
+  const files = await res.json();
+  const iconSet = new Set();
+  for (const file of files) {
+    if (file.type === 'file' && file.name.endsWith('.ico')) {
+      iconSet.add(file.name);
+    }
+  }
+  return iconSet;
+}
+
+async function downloadFavicon(url) {
+  try {
+    const siteUrl = new URL(url);
+    const hostname = siteUrl.hostname.replace(/^www\./, '');
+    const origin = siteUrl.origin;
+
+    const candidates = [
+      `${origin}/favicon.ico`,
+      `${origin}/apple-touch-icon.png`,
+      `${origin}/icon.png`,
+      `https://www.google.com/s2/favicons?domain=${hostname}&sz=64`,
+    ];
+
+    for (const favUrl of candidates) {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 8000);
+      try {
+        const response = await fetch(favUrl, {
+          signal: controller.signal,
+          headers: { 'User-Agent': 'Mozilla/5.0 (compatible; FaviconBot)' },
+        });
+        clearTimeout(timeoutId);
+
+        if (!response.ok || response.status === 404) continue;
+
+        const buffer = await response.arrayBuffer();
+        if (buffer.byteLength < 100) continue;
+
+        const firstBytes = new Uint8Array(buffer).slice(0, 4);
+        const isImage =
+          (firstBytes[0] === 0x89 && firstBytes[1] === 0x50) || // PNG
+          (firstBytes[0] === 0xff && firstBytes[1] === 0xd8) || // JPEG
+          buffer.byteLength > 200; // ICO or fallback
+
+        if (isImage) {
+          return { buffer, hostname };
+        }
+      } catch (e) {
+        // ignore
+      }
+    }
+  } catch (e) {
+    // invalid URL
+  }
+  return null;
+}
+
+async function uploadIconToGitHub(filename, buffer) {
+  const path = `public/sitelogo/${filename}`;
+  const apiUrl = `https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/contents/${path}`;
+
+  const body = {
+    message: `feat(icon): add ${filename}`,
+    content: Buffer.from(buffer).toString('base64'),
+    branch: GITHUB_BRANCH,
+  };
+
+  const res = await fetch(apiUrl, {
+    method: 'PUT',
+    headers: {
+      Authorization: `token ${GITHUB_TOKEN}`,
+      'Content-Type': 'application/json',
+      'User-Agent': 'Vercel-Webhook-Sync',
+    },
+    body: JSON.stringify(body),
+  });
+
+  if (!res.ok) {
+    const errText = await res.text();
+    throw new Error(`Upload ${filename} failed (${res.status}): ${errText}`);
+  }
+  return await res.json();
+}
+
 // 从 GitHub 获取当前 mock_data.js 内容（用于去重和分类复用）
 async function fetchCurrentMockData() {
   const apiUrl = `https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/contents/${GITHUB_FILE_PATH}`;
@@ -266,17 +366,22 @@ module.exports = async (req, res) => {
         existingUrls.add(site.url);
       }
     }
-
-    // 2. 从 Gitee 下载 bookmarks.html
+    // 2. 【新增】获取 GitHub 上已存在的图标文件名集合
+    const existingIcons = await listExistingIcons();
+    console.log(`🖼️ GitHub 上已有 ${existingIcons.size} 个图标`);
+    
+    // 3. 从 Gitee 下载 bookmarks.html
     const html = await fetchFileFromGitee();
     console.log(`📥 成功从 Gitee 下载: ${GITEE_OWNER}/${GITEE_REPO}/${GITEE_FILE_PATH}`);
 
-    // 3. 解析所有书签（不分组）
+    // 4. 解析所有书签（不分组）
     const allBookmarks = parseBookmarks(html);
     console.log(`✅ 解析出 ${allBookmarks.length} 个书签`);
 
-    // 4. 处理新书签
+    // 5. 处理新书签 + 收集需要下载的图标
     let addedCount = 0;
+    const iconsToUpload = []; // { filename, buffer }
+    
     for (const { url, name } of allBookmarks) {
       if (existingUrls.has(url)) continue;
 
@@ -308,9 +413,21 @@ module.exports = async (req, res) => {
 
       existingUrls.add(url);
       addedCount++;
+
+      // 【新增】如果图标不存在，则尝试下载
+      if (!existingIcons.has(iconFilename)) {
+        const favicon = await downloadFavicon(url);
+        if (favicon && favicon.hostname === hostname) {
+          iconsToUpload.push({ filename: iconFilename, buffer: favicon.buffer });
+          existingIcons.add(iconFilename); // 防止重复下载同一域名
+          console.log(`📥 准备上传图标: ${iconFilename}`);
+        } else {
+          console.log(`⚠️ 无法下载图标: ${iconFilename}`);
+        }
+      }
     }
 
-    // 5. 重组 categories（保持原顺序 + 新增放最后）
+    // 6. 重组 categories（保持原顺序 + 新增放最后）
     const finalCategories = [];
     const usedIds = new Set();
 
@@ -327,7 +444,7 @@ module.exports = async (req, res) => {
       }
     }
 
-    // 6. 生成新 mock_data.js
+    // 7. 生成新 mock_data.js
     const newData = {
       categories: finalCategories,
       title: currentData.title || "龙的导航🐱",
@@ -339,7 +456,7 @@ module.exports = async (req, res) => {
       .replace(/"id":\s*"([^"]+)"/g, '"id": "$1"');
     const jsContent = `export const mockData = ${jsonStr};\n`;
 
-    // 7. 获取当前 SHA（用于更新）
+    // 8. 获取当前 SHA（用于更新）
     const headRes = await fetch(`https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/contents/${GITHUB_FILE_PATH}`, {
       headers: { Authorization: `token ${GITHUB_TOKEN}`, 'User-Agent': 'Vercel-Webhook-Sync' },
     });
@@ -349,11 +466,23 @@ module.exports = async (req, res) => {
       sha = headData.sha;
     }
 
-    // 8. 推送到 GitHub
+    // 9. 推送到 GitHub
     await updateFileOnGitHub(jsContent, sha);
     console.log(`🚀 成功推送到 GitHub: ${addedCount} 个新书签`);
 
-    return res.status(200).json({ success: true, added: addedCount });
+    // 10. 【新增】上传新图标
+    for (const { filename, buffer } of iconsToUpload) {
+      await uploadIconToGitHub(filename, buffer);
+    }
+    if (iconsToUpload.length > 0) {
+      console.log(`🖼️ 成功上传 ${iconsToUpload.length} 个新图标`);
+    }
+    
+    return res.status(200).json({ 
+      success: true,
+      added: addedCount,
+      addedIcons: iconsToUpload.length 
+    });
 
   } catch (error) {
     console.error('💥 同步失败:', error.message || error);
